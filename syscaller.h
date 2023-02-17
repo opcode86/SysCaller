@@ -41,9 +41,8 @@ inline static WORD GetSyscallIdMem(BYTE* bytes)
 
 	while (true)
 	{
-		if (offset >= 0xc) // Some barrier to not go forever if funky hooks are installed
-
-			bytes[offset];
+		if (offset >= 0x17) // 0x20 - 0x08 - 0x01
+			break;
 
 		if (
 			bytes[offset] == 0x4c &&
