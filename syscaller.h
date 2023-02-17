@@ -1,7 +1,10 @@
 #pragma once
-#include <minwindef.h>
 #include <memoryapi.h>
 #include <vector>
+
+//
+// Helper functions
+//
 
 template <typename T>
 static inline auto GetBytes(unsigned char* bytes, DWORD offset, size_t custom_size = 0) -> T
@@ -15,7 +18,7 @@ static inline auto GetBytes(unsigned char* bytes, DWORD offset, size_t custom_si
 }
 
 
-static inline DWORD RVAToOffset(unsigned char* bytes, DWORD offset, IMAGE_DOS_HEADER dosheader, IMAGE_NT_HEADERS ntheader)
+static DWORD RVAToOffset(unsigned char* bytes, DWORD offset, IMAGE_DOS_HEADER dosheader, IMAGE_NT_HEADERS ntheader)
 {
 	for (int i = 0; i < ntheader.FileHeader.NumberOfSections; i++)
 	{
@@ -30,12 +33,40 @@ static inline DWORD RVAToOffset(unsigned char* bytes, DWORD offset, IMAGE_DOS_HE
 	return 0x0;
 }
 
-static inline void* GetSyscallFunction(DWORD SyscallId)
+inline static WORD GetSyscallIdMem(BYTE* bytes)
 {
-	unsigned char id[4];
-	memcpy(id, &SyscallId, sizeof(DWORD));
+	DWORD offset = 0x0;
 
-	const unsigned char code[] = {
+
+
+	while (true)
+	{
+		if (offset >= 0xc) // Some barrier to not go forever if funky hooks are installed
+
+			bytes[offset];
+
+		if (
+			bytes[offset] == 0x4c &&
+			bytes[offset + 1] == 0x8b &&
+			bytes[offset + 2] == 0xd1 &&
+			bytes[offset + 3] == 0xb8)
+		{
+			unsigned char id[2] = { bytes[offset + 4], bytes[offset + 5] };
+			return *reinterpret_cast<WORD*>(id);
+		}
+
+		offset++;
+	}
+
+	return 0x0;
+}
+
+static inline void* GetSyscallFunction(WORD SyscallId)
+{
+	BYTE id[2];
+	memcpy(id, &SyscallId, sizeof(WORD));
+
+	const BYTE code[] = {
 		// mov rax, gs: [0x60]
 		0x65, 0x48, 0x8b, 0x04, 0x25, 0x60, 0x00,
 		0x00, 0x00,
@@ -44,7 +75,7 @@ static inline void* GetSyscallFunction(DWORD SyscallId)
 		0x4C, 0x8B, 0xD1,
 
 		// mov eax, SyscallId
-		0xB8, id[0], id[1], id[2], id[3],
+		0xB8, id[0], id[1], 0x00, 0x00,
 
 		// syscall
 		0x0f, 0x05,
@@ -59,6 +90,16 @@ static inline void* GetSyscallFunction(DWORD SyscallId)
 	return exec;
 }
 
+// Helper function to check if offset differs from RVA, if they are the same something went wrong...
+static inline bool ValidateOffset(DWORD RVA, DWORD offset)
+{
+	return !(RVA == offset);
+}
+
+//
+// Main functions
+//
+
 inline void* syscall(PCSTR function)
 {
 	std::ifstream input("C:\\Windows\\System32\\ntdll.dll", std::ios::binary);
@@ -66,16 +107,20 @@ inline void* syscall(PCSTR function)
 	if (!input) // Can't open ntdll.dll for some reason
 		return nullptr;
 
-	std::vector<unsigned char> temp(
+	std::vector<BYTE> temp(
 		(std::istreambuf_iterator<char>(input)),
 		(std::istreambuf_iterator<char>()));
 
 	input.close();
-	unsigned char* dllFile = temp.data();
+	BYTE* dllFile = temp.data();
 
 	IMAGE_DOS_HEADER dosheader2 = GetBytes<IMAGE_DOS_HEADER>(dllFile, 0x0);
 	IMAGE_NT_HEADERS ntheaders = GetBytes<IMAGE_NT_HEADERS>(dllFile, dosheader2.e_lfanew);
 	DWORD exportadr = RVAToOffset(dllFile, ntheaders.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress, dosheader2, ntheaders);
+
+	if (!ValidateOffset(exportadr, ntheaders.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress))
+		return nullptr;
+
 	IMAGE_EXPORT_DIRECTORY exports = GetBytes<IMAGE_EXPORT_DIRECTORY>(dllFile, exportadr);
 
 	DWORD offset = 0x0;
@@ -83,48 +128,90 @@ inline void* syscall(PCSTR function)
 	DWORD adrOfFunctions = RVAToOffset(dllFile, exports.AddressOfFunctions, dosheader2, ntheaders);
 	DWORD adrOfOrdinals = RVAToOffset(dllFile, exports.AddressOfNameOrdinals, dosheader2, ntheaders);
 
-	DWORD tempByteOffset = exports.AddressOfNameOrdinals - adrOfOrdinals; // Could be any of the above
+	if (!ValidateOffset(exports.AddressOfNames, adrOfNames)
+		|| !ValidateOffset(exports.AddressOfFunctions, adrOfFunctions)
+		|| !ValidateOffset(exports.AddressOfNameOrdinals, adrOfOrdinals))
+		return nullptr;
 
+	DWORD tempByteOffset = exports.AddressOfNameOrdinals - adrOfOrdinals; // Could be any of the above
 
 	for (DWORD i = 0; i < exports.NumberOfNames; i++)
 	{
 		offset = 0x0;
-		std::vector<unsigned char> tempByteVector;
+		std::vector<BYTE> tempByteVector;
 
 		DWORD nameAdrs = GetBytes<DWORD>(dllFile, adrOfNames + i * 4);
+		BYTE tempByte = 0x1;
 
-		while (true)
+		while (tempByte != 0x0)
 		{
-			BYTE tempByte = dllFile[nameAdrs + offset - tempByteOffset];
+			tempByte = dllFile[nameAdrs + offset - tempByteOffset];
 			offset++;
 
 			tempByteVector.push_back(tempByte);
-
-			if (tempByte == 0x0) // End of function name
-			{
-				PCSTR func = (PSTR)tempByteVector.data();
-
-				if (strcmp(func, function) == 0)
-				{
-					WORD ordTemp = GetBytes<WORD>(dllFile, adrOfOrdinals + i * 2);
-					DWORD funcAdrs = GetBytes<DWORD>(dllFile, adrOfFunctions + ordTemp * 4);
-					DWORD funcBytes = RVAToOffset(dllFile, funcAdrs, dosheader2, ntheaders);
-
-					// Check for syscall instruction, return nullptr if not found... these offsets should not be hardcoded
-					if (dllFile[funcBytes + 18] != 0x0f || dllFile[funcBytes + 19] != 0x05)
-						return nullptr;
-
-					DWORD syscallId = GetBytes<DWORD>(dllFile, funcBytes + 4);
-
-					return GetSyscallFunction(syscallId);
-				}
-
-				break;
-			}
 		}
+
+		PCSTR func = (PSTR)tempByteVector.data();
+
+
+		if (strcmp(func, function) != 0x0)
+			continue;
+
+
+		WORD ordTemp = GetBytes<WORD>(dllFile, adrOfOrdinals + i * 2);
+		DWORD funcAdrs = GetBytes<DWORD>(dllFile, adrOfFunctions + ordTemp * 4);
+		DWORD funcBytes = RVAToOffset(dllFile, funcAdrs, dosheader2, ntheaders);
+
+		if (!ValidateOffset(funcAdrs, funcBytes))
+
+			// Check for syscall instruction, return nullptr if not found... these offsets should not be hardcoded
+			if (dllFile[funcBytes + 18] != 0x0f || dllFile[funcBytes + 19] != 0x05)
+				return nullptr;
+
+		WORD syscallId = GetBytes<WORD>(dllFile, funcBytes + 4);
+
+		return GetSyscallFunction(syscallId);
+
 	}
 
 	return nullptr;
 }
 
-#define SYSCALL(a) syscall(a)
+inline void* syscall_mem(PCSTR function)
+{
+	HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+
+	if (!ntdll)
+		return nullptr;
+
+	PIMAGE_DOS_HEADER dosheader2 = (PIMAGE_DOS_HEADER)ntdll;
+	PIMAGE_NT_HEADERS ntheaders = (PIMAGE_NT_HEADERS)((BYTE*)ntdll + dosheader2->e_lfanew);
+
+	PIMAGE_EXPORT_DIRECTORY exports = (PIMAGE_EXPORT_DIRECTORY)((BYTE*)ntdll + ntheaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress);
+	
+	DWORD* adrOfNames = (DWORD*)((BYTE*)ntdll + exports->AddressOfNames);
+	DWORD* adrOfFunctions = (DWORD*)((BYTE*)ntdll + exports->AddressOfFunctions);
+	WORD* adrOfOrdinals = (WORD*)((BYTE*)ntdll + exports->AddressOfNameOrdinals);
+
+	for (DWORD i = 0; i < exports->NumberOfNames; i++)
+	{
+		PCSTR func = (PSTR)((BYTE*)ntdll + adrOfNames[i]);
+
+		if (strcmp(func, function) != 0x0)
+			continue;
+
+		BYTE* funcAdrs = (BYTE*)((BYTE*)ntdll + adrOfFunctions[adrOfOrdinals[i]]);
+
+		WORD syscallId = GetSyscallIdMem(funcAdrs);
+
+		if (syscallId == 0x0)
+			return nullptr;
+
+		return GetSyscallFunction(syscallId);
+	}
+
+	return nullptr;
+}
+
+#define SYSCALL(FunctionName) syscall(FunctionName)
+#define SYSCALL_MEM(FunctionName) syscall_mem(FunctionName)
