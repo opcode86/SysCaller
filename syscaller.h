@@ -307,11 +307,11 @@ template <typename RetVal, typename... Args>
 inline auto syscall_x86(const char* function, bool mem = false)
 {
 	const auto syscallId = mem ? GetSyscallIdMem(function) : GetSyscallId(function);
-	const auto sc = (RetVal(__stdcall*)(uint64_t ...))GetSyscallFunction_x86(syscallId);
+	const auto sc = (RetVal(*)(uint64_t ...))GetSyscallFunction_x86(syscallId);
 
 	return [sc](Args ... args) -> RetVal
 	{
-		return reinterpret_cast<RetVal(__stdcall*)(uint64_t ...)>(sc)(
+		return reinterpret_cast<RetVal(*)(uint64_t ...)>(sc)(
 			sizeof...(Args) > 4 ? (sizeof...(Args) - 4) : 0,
 			(uint64_t)(args)...
 		);
